@@ -79,9 +79,44 @@ import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.joinQQGroup
 import me.rerere.rikkahub.utils.openUrl
 import me.rerere.rikkahub.utils.plus
-import me.rerere.rikkahub.utils.requestFreshGpsLocation
+import me.rerere.rikkahub.utils.LocationCache
+import me.rerere.rikkahub.utils.formatLocation
+import me.rerere.rikkahub.utils.startContinuousLocationListening
+import kotlinx.coroutines.delay
+import me.rerere.rikkahub.utils.getCurrentLocation
+import me.rerere.rikkahub.utils.hasLocationPermission
+import me.rerere.rikkahub.utils.stopContinuousLocationListening
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
+
+@Composable
+private fun rememberLocationDisplay(enabled: Boolean): String {
+    val context = LocalContext.current
+    val locationInfo by produceState(initialValue = if (enabled) "正在获取位置..." else "已关闭，不获取位置") {
+        while (enabled) {
+            delay(2000)
+            if (hasLocationPermission(context)) {
+                val loc = getCurrentLocation(context)
+                value = if (loc != null) {
+                    val provider = when {
+                        loc.provider == android.location.LocationManager.GPS_PROVIDER -> "GPS"
+                        loc.provider == android.location.LocationManager.NETWORK_PROVIDER -> "基站/WiFi"
+                        loc.provider == android.location.LocationManager.PASSIVE_PROVIDER -> "被动定位"
+                        else -> loc.provider
+                    }
+                    val listening = if (LocationCache.isListening) "实时监" else "单次"
+                    val acc = if (loc.hasAccuracy()) " ±${loc.accuracy.toInt()}m" else ""
+                    "已开启 · $provider · ${formatLocation(loc)}$acc"
+                } else {
+                    "已开启，等待定位..."
+                }
+            } else {
+                value = "已开启，等待权限..."
+            }
+        }
+    }
+    return locationInfo
+}
 
 @Composable
 fun SettingPage(vm: SettingVM = koinViewModel()) {
@@ -199,7 +234,9 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                             vm.updateSettings(settings.copy(locationEnabled = newValue))
                             if (newValue) {
                                 me.rerere.rikkahub.utils.requestLocationPermission(context)
-                                me.rerere.rikkahub.utils.requestFreshGpsLocation(context)
+                                startContinuousLocationListening(context)
+                            } else {
+                                stopContinuousLocationListening(context)
                             }
                         },
                         leadingContent = { Icon(HugeIcons.Pin, null) },
@@ -210,14 +247,17 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                                     vm.updateSettings(settings.copy(locationEnabled = it))
                                     if (it) {
                                         me.rerere.rikkahub.utils.requestLocationPermission(context)
-                                        me.rerere.rikkahub.utils.requestFreshGpsLocation(context)
+                                        startContinuousLocationListening(context)
+                                    } else {
+                                        stopContinuousLocationListening(context)
                                     }
                                 }
                             )
                         },
                         headlineContent = { Text("位置信息") },
                         supportingContent = {
-                            Text(if (settings.locationEnabled) "已开启，AI 可获取位置" else "已关闭，不获取位置")
+                            val locationText = rememberLocationDisplay(settings.locationEnabled)
+                            Text(locationText)
                         },
                     )
                     item(

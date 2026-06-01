@@ -13,19 +13,165 @@ import android.os.Looper
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
 
 private const val TAG = "LocationUtils"
 private const val REQUEST_LOCATION_PERMISSION_CODE = 1001
-private const val GPS_TIMEOUT_MS = 5000L
+private const val GPS_TIMEOUT_MS = 10000L
+private const val GPS_CACHE_FRESH_MS = 120_000L // 2分钟内的GPS缓存有效
 
 /**
- * 缓存最近一次获取到的 GPS 位置
- * 用于 PlaceholderTransformer 同步读取
+ * 最近一次获取到的 GPS 位置缓存
+ * 由持续监听器更新，供同步读取
  */
 object LocationCache {
     var lastLocation: Location? = null
     var lastRefreshTime: Long = 0L
+    var isListening: Boolean = false
+
+    /** 获取位置的提供者描述 */
+    val providerDescription: String
+        get() {
+            val loc = lastLocation ?: return "无"
+            return when (loc.provider) {
+                LocationManager.GPS_PROVIDER -> "GPS"
+                LocationManager.NETWORK_PROVIDER -> "基站/WiFi"
+                LocationManager.PASSIVE_PROVIDER -> "被动定位"
+                else -> loc.provider ?: "未知"
+            }
+        }
+
+    /** 获取位置精度描述 */
+    val accuracyDescription: String
+        get() {
+            val loc = lastLocation ?: return ""
+            return if (loc.hasAccuracy()) "${loc.accuracy.toInt()}米" else "未知"
+        }
 }
+
+// ─── 持续 GPS 监听 ─────────────────────────────────
+
+/**
+ * 全局唯一的持续 GPS 监听器
+ * 只要位置开关开着就保持监听，一旦有新的 GPS 信号就更新缓存
+ */
+private var continuousListener: LocationListener? = null
+
+/**
+ * 启动持续 GPS 监听
+ * 当用户开启位置开关时调用
+ * - 如果权限不足，什么都不做
+ * - 已经在监听，先停止再重启
+ */
+fun startContinuousLocationListening(context: Context) {
+    if (!hasLocationPermission(context)) {
+        Log.w(TAG, "startContinuousLocationListening: no permission")
+        return
+    }
+
+    // 如果已经在监听，先停掉
+    if (LocationCache.isListening) {
+        stopContinuousLocationListening(context)
+    }
+
+    try {
+        val locationManager =
+            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) {
+                Log.d(TAG, "Continuous GPS fix: ${location.latitude},${location.longitude} acc=${location.accuracy} provider=${location.provider}")
+                LocationCache.lastLocation = location
+                LocationCache.lastRefreshTime = System.currentTimeMillis()
+            }
+
+            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+            override fun onProviderEnabled(provider: String) {
+                Log.d(TAG, "Provider enabled: $provider")
+            }
+
+            override fun onProviderDisabled(provider: String) {
+                Log.d(TAG, "Provider disabled: $provider")
+            }
+        }
+
+        // 请求持续位置更新（1秒最小间隔，5米最小距离）
+        // 优先用 GPS_PROVIDER，如果 GPS 没开则用 NETWORK_PROVIDER
+        val providers = listOf(
+            LocationManager.GPS_PROVIDER,
+            LocationManager.NETWORK_PROVIDER
+        )
+
+        var anyProviderStarted = false
+        for (provider in providers) {
+            if (locationManager.isProviderEnabled(provider)) {
+                try {
+                    locationManager.requestLocationUpdates(
+                        provider,
+                        1000L,           // 最小时间间隔：1秒
+                        5f,              // 最小距离变化：5米
+                        listener,
+                        Looper.getMainLooper()
+                    )
+                    Log.d(TAG, "Started continuous listening on $provider")
+                    anyProviderStarted = true
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Security exception starting $provider", e)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error starting $provider", e)
+                }
+            }
+        }
+
+        if (anyProviderStarted) {
+            continuousListener = listener
+            LocationCache.isListening = true
+            Log.i(TAG, "Continuous location listening started")
+        } else {
+            Log.w(TAG, "No location provider available")
+        }
+
+        // 同时也尝试获取一次上次的已知位置作为初始缓存
+        try {
+            val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (lastKnown != null) {
+                LocationCache.lastLocation = lastKnown
+                LocationCache.lastRefreshTime = System.currentTimeMillis()
+                Log.d(TAG, "Initial cache from lastKnown: ${lastKnown.provider}")
+            }
+        } catch (_: SecurityException) {}
+
+    } catch (e: SecurityException) {
+        Log.e(TAG, "Security exception in startContinuousLocationListening", e)
+    } catch (e: Exception) {
+        Log.e(TAG, "Error starting continuous location listening", e)
+    }
+}
+
+/**
+ * 停止持续 GPS 监听
+ * 当用户关闭位置开关时调用
+ */
+fun stopContinuousLocationListening(context: Context) {
+    val listener = continuousListener ?: return
+    try {
+        val locationManager =
+            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+        locationManager.removeUpdates(listener)
+    } catch (e: Exception) {
+        Log.w(TAG, "Error stopping location listening", e)
+    }
+    continuousListener = null
+    LocationCache.isListening = false
+    Log.i(TAG, "Continuous location listening stopped")
+}
+
+// ─── 权限相关 ─────────────────────────────────────
 
 /**
  * 检查位置权限是否已授予
@@ -43,6 +189,7 @@ fun hasLocationPermission(context: Context): Boolean {
 
 /**
  * 请求位置权限
+ * 授权后自动启动持续定位
  */
 fun requestLocationPermission(context: Context) {
     if (!hasLocationPermission(context)) {
@@ -56,151 +203,125 @@ fun requestLocationPermission(context: Context) {
             REQUEST_LOCATION_PERMISSION_CODE
         )
     } else {
-        // 权限已有，直接开始获取 GPS 定位
-        requestFreshGpsLocation(context)
+        // 权限已有，启动持续监听
+        startContinuousLocationListening(context)
     }
 }
 
-/**
- * 主动请求一次新鲜 GPS 定位（异步）
- * 使用 GPS_PROVIDER 获取实时 GPS 数据，而不是用缓存位置
- * 获取成功后更新 LocationCache
- */
-fun requestFreshGpsLocation(context: Context) {
-    if (!hasLocationPermission(context)) {
-        Log.w(TAG, "No location permission, cannot request GPS")
-        return
-    }
-
-    try {
-        val locationManager =
-            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-                ?: return
-
-        // 检查 GPS 是否开启
-        if (!locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            Log.w(TAG, "GPS provider is disabled on device")
-            // 尝试用 NETWORK_PROVIDER 作为备选
-            requestNetworkLocation(locationManager, context)
-            return
-        }
-
-        Log.d(TAG, "Requesting fresh GPS fix...")
-
-        val gpsListener = object : LocationListener {
-            override fun onLocationChanged(location: Location) {
-                Log.d(TAG, "GPS fix obtained: ${location.latitude}, ${location.longitude}, accuracy: ${location.accuracy}")
-                LocationCache.lastLocation = location
-                LocationCache.lastRefreshTime = System.currentTimeMillis()
-                locationManager.removeUpdates(this)
-            }
-
-            override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
-            override fun onProviderEnabled(provider: String) {}
-            override fun onProviderDisabled(provider: String) {}
-        }
-
-        // 先尝试拿一次缓存中的 GPS 位置（如果有的话）
-        val cachedGps = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-        if (cachedGps != null && System.currentTimeMillis() - cachedGps.time < 60000) {
-            // 1分钟内的 GPS 缓存可用
-            Log.d(TAG, "Using cached GPS fix from ${cachedGps.time}")
-            LocationCache.lastLocation = cachedGps
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return
-        }
-
-        // 请求一次新的 GPS 位置更新
-        locationManager.requestSingleUpdate(
-            LocationManager.GPS_PROVIDER,
-            gpsListener,
-            Looper.getMainLooper()
-        )
-
-        // 设置超时：5秒后如果 GPS 还没定位到，就用缓存或网络位置
-        android.os.Handler(Looper.getMainLooper()).postDelayed({
-            if (LocationCache.lastLocation == null ||
-                LocationCache.lastRefreshTime < System.currentTimeMillis() - 1000) {
-                Log.d(TAG, "GPS timeout, falling back to network")
-                locationManager.removeUpdates(gpsListener)
-                requestNetworkLocation(locationManager, context)
-            }
-        }, GPS_TIMEOUT_MS)
-
-    } catch (e: SecurityException) {
-        Log.e(TAG, "Security exception requesting GPS", e)
-    } catch (e: Exception) {
-        Log.e(TAG, "Error requesting GPS location", e)
-    }
-}
-
-/**
- * 通过 NETWORK_PROVIDER 获取位置（基站/WiFi 定位，精度较低）
- */
-private fun requestNetworkLocation(locationManager: LocationManager, context: Context) {
-    try {
-        val networkLocation = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-        if (networkLocation != null) {
-            Log.d(TAG, "Got network location: ${networkLocation.latitude}, ${networkLocation.longitude}")
-            LocationCache.lastLocation = networkLocation
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-        } else {
-            Log.w(TAG, "No network location available either")
-        }
-    } catch (e: SecurityException) {
-        Log.e(TAG, "Security exception getting network location", e)
-    }
-}
+// ─── 获取位置（同步读取）────────────────────────────
 
 /**
  * 获取当前位置（同步方法）
- * 优先使用缓存的新鲜 GPS 数据，否则 fallback 到 getLastKnownLocation
+ *
+ * 优先返回持续监听器缓存的新鲜 GPS 数据
+ * 如果缓存过期或不存在，尝试获取一次新鲜的 GPS 定位（最多等 10 秒）
+ * 超时后拿 NETWORK 位置兜底
  */
 fun getCurrentLocation(context: Context): Location? {
-    // 如果缓存中有 2 分钟内的新鲜位置，直接返回
-    if (LocationCache.lastLocation != null &&
-        System.currentTimeMillis() - LocationCache.lastRefreshTime < 120000) {
-        return LocationCache.lastLocation
+    // 1. 检查缓存是否有新鲜 GPS 数据（2分钟内）
+    val cache = LocationCache.lastLocation
+    val cacheAge = System.currentTimeMillis() - LocationCache.lastRefreshTime
+    if (cache != null && cacheAge < GPS_CACHE_FRESH_MS) {
+        Log.d(TAG, "Using cache: ${cache.provider}, age=${cacheAge}ms, acc=${if (cache.hasAccuracy()) cache.accuracy else "N/A"}")
+        return cache
     }
 
-    // 否则尝试获取 GPS 的 last known location
     if (!hasLocationPermission(context)) return null
 
-    return try {
-        val locationManager =
-            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
-                ?: return null
+    val locationManager =
+        context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
 
-        // 优先 GPS
-        locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)?.let {
-            Log.d(TAG, "getCurrentLocation: using GPS provider")
-            LocationCache.lastLocation = it
+    // 2. 尝试获取最新已知位置（缓存已过期但 lastKnown 是新数据）
+    try {
+        val gpsLast = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+        if (gpsLast != null && System.currentTimeMillis() - gpsLast.time < GPS_CACHE_FRESH_MS) {
+            Log.d(TAG, "getCurrentLocation: lastKnown GPS, acc=${gpsLast.accuracy}")
+            LocationCache.lastLocation = gpsLast
             LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return it
+            return gpsLast
         }
+    } catch (_: SecurityException) {}
 
-        // 其次 NETWORK
-        locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)?.let {
-            Log.d(TAG, "getCurrentLocation: using NETWORK provider")
-            LocationCache.lastLocation = it
+    // 3. 如果 GPS 没在持续监听，尝试同步获取一次新鲜定位
+    if (!LocationCache.isListening && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+        Log.d(TAG, "No continuous listener, trying one-shot GPS...")
+        val syncLocation = tryGetGpsSync(locationManager)
+        if (syncLocation != null) {
+            LocationCache.lastLocation = syncLocation
             LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return it
+            return syncLocation
         }
-
-        // 最后 PASSIVE
-        locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)?.let {
-            Log.d(TAG, "getCurrentLocation: using PASSIVE provider")
-            LocationCache.lastLocation = it
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return it
-        }
-
-        null
-    } catch (e: SecurityException) {
-        Log.e(TAG, "Security exception getting location", e)
-        null
     }
+
+    // 4. 兜底：获取网络位置
+    try {
+        val network = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+        if (network != null) {
+            Log.d(TAG, "getCurrentLocation: fallback to NETWORK, acc=${if (network.hasAccuracy()) network.accuracy else "N/A"}")
+            LocationCache.lastLocation = network
+            LocationCache.lastRefreshTime = System.currentTimeMillis()
+            return network
+        }
+    } catch (_: SecurityException) {}
+
+    // 5. 最后的兜底：被动位置
+    try {
+        val passive = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)
+        if (passive != null) {
+            LocationCache.lastLocation = passive
+            LocationCache.lastRefreshTime = System.currentTimeMillis()
+            return passive
+        }
+    } catch (_: SecurityException) {}
+
+    return null
 }
+
+/**
+ * 同步等待一次 GPS 定位（使用 suspendCancellableCoroutine 优雅等待）
+ * 最多等 GPS_TIMEOUT_MS 毫秒
+ */
+private fun tryGetGpsSync(locationManager: LocationManager): Location? {
+    // 使用 CountDownLatch 在主线程回调上同步等待
+    val latch = java.util.concurrent.CountDownLatch(1)
+    var result: Location? = null
+
+    val listener = object : LocationListener {
+        override fun onLocationChanged(location: Location) {
+            result = location
+            LocationCache.lastLocation = location
+            LocationCache.lastRefreshTime = System.currentTimeMillis()
+            latch.countDown()
+            locationManager.removeUpdates(this)
+        }
+
+        override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+        override fun onProviderEnabled(provider: String) {}
+        override fun onProviderDisabled(provider: String) {}
+    }
+
+    try {
+        locationManager.requestSingleUpdate(
+            LocationManager.GPS_PROVIDER,
+            listener,
+            Looper.getMainLooper()
+        )
+        val acquired = latch.await(GPS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        if (acquired && result != null) {
+            Log.d(TAG, "tryGetGpsSync: got fix, acc=${result!!.accuracy}")
+            return result
+        }
+        // 超时，移除监听
+        locationManager.removeUpdates(listener)
+        Log.w(TAG, "tryGetGpsSync: timeout after ${GPS_TIMEOUT_MS}ms")
+    } catch (e: SecurityException) {
+        Log.e(TAG, "SecurityException in tryGetGpsSync", e)
+    }
+
+    return null
+}
+
+// ─── 格式化输出 ──────────────────────────────────
 
 /**
  * 格式化位置信息为文本
@@ -220,20 +341,21 @@ fun getFormattedLocation(context: Context): String? {
             location.provider == LocationManager.PASSIVE_PROVIDER -> "被动"
             else -> location.provider
         }
-        // 判断精度是否来自 GPS（精度 < 100m 通常意味着 GPS 锁定）
         val accuracyNote = if (location.hasAccuracy() && location.accuracy < 100f) {
-            "（GPS 精确定位）"
+            "（GPS 精确定位，精度约${location.accuracy.toInt()}米）"
         } else if (location.hasAccuracy()) {
-            "（精度约 ±${location.accuracy.toInt()}m）"
+            "（精度约${location.accuracy.toInt()}米）"
         } else {
             ""
         }
-        "Latitude: %.6f, Longitude: %.6f$accuracyNote".format(
+        "Latitude: %.6f, Longitude: %.6f $provider$accuracyNote".format(
             location.latitude,
             location.longitude
         )
     }
 }
+
+// ─── Context 工具 ────────────────────────────────
 
 /**
  * 从 Context 递归查找 Activity

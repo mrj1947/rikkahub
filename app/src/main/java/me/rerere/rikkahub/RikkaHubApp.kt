@@ -33,6 +33,7 @@ import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.service.WebServerService
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
+import me.rerere.rikkahub.utils.startContinuousLocationListening
 import org.koin.android.ext.android.get
 import org.koin.android.ext.koin.androidContext
 import org.koin.android.ext.koin.androidLogger
@@ -83,10 +84,37 @@ class RikkaHubApp : Application() {
         // Start WebServer if enabled in settings
         startWebServerIfEnabled()
 
+        // Start location listener if enabled in settings
+        startLocationListenerIfEnabled()
+
         // Increment launch count
         incrementLaunchCount()
 
         // Composer.setDiagnosticStackTraceMode(ComposeStackTraceMode.Auto)
+    }
+
+    private fun startLocationListenerIfEnabled() {
+        get<AppScope>().launch {
+            runCatching {
+                delay(500)
+                val settings = get<SettingsStore>().settingsFlowRaw.first()
+                if (settings.locationEnabled && hasFineLocationPermission()) {
+                    Log.i(TAG, "startLocationListenerIfEnabled: starting continuous GPS listener")
+                    startContinuousLocationListening(this@RikkaHubApp)
+                } else if (settings.locationEnabled) {
+                    Log.d(TAG, "startLocationListenerIfEnabled: location enabled but no permission yet")
+                }
+            }.onFailure {
+                Log.e(TAG, "startLocationListenerIfEnabled failed", it)
+            }
+        }
+    }
+
+    private fun hasFineLocationPermission(): Boolean {
+        return ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun incrementLaunchCount() {
