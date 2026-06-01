@@ -13,6 +13,7 @@ import me.rerere.rikkahub.R
 import me.rerere.rikkahub.data.datastore.SettingsStore
 import me.rerere.rikkahub.data.datastore.getCurrentAssistant
 import me.rerere.rikkahub.data.model.Assistant
+import me.rerere.rikkahub.utils.getFormattedLocation
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
 import java.time.LocalDate
@@ -110,6 +111,15 @@ object DefaultPlaceholderProvider : PlaceholderProvider {
 
         placeholder("user", { Text(stringResource(R.string.placeholder_user)) }) {
             it.settingsStore.settingsFlow.value.displaySetting.userNickname.ifBlank { "user" }
+        }
+
+        placeholder("location", { Text(stringResource(R.string.placeholder_location)) }) {
+            val settings = it.settingsStore.settingsFlow.value
+            if (settings.locationEnabled) {
+                getFormattedLocation(it.context) ?: "未知位置（GPS 未定位到）"
+            } else {
+                "未开启位置权限"
+            }
         }
     }
 

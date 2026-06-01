@@ -476,6 +476,7 @@
   <string name="placeholder_system_version">系统版本</string>
   <string name="placeholder_timezone">时区</string>
   <string name="placeholder_user">用户</string>
+  <string name="placeholder_location">位置信息</string>
   <string name="prompt_page_add">添加</string>
   <string name="prompt_page_add_entry">添加条目</string>
   <string name="prompt_page_add_lorebook">添加世界书</string>

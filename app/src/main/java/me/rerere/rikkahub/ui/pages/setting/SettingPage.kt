@@ -23,6 +23,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -55,6 +56,7 @@ import me.rerere.hugeicons.stroke.LookTop
 import me.rerere.hugeicons.stroke.McpServer
 import me.rerere.hugeicons.stroke.Megaphone01
 import me.rerere.hugeicons.stroke.Package
+import me.rerere.hugeicons.stroke.Pin
 import me.rerere.hugeicons.stroke.ServerStack01
 import me.rerere.hugeicons.stroke.Settings03
 import me.rerere.hugeicons.stroke.Share04
@@ -77,11 +79,13 @@ import me.rerere.rikkahub.ui.theme.CustomColors
 import me.rerere.rikkahub.utils.joinQQGroup
 import me.rerere.rikkahub.utils.openUrl
 import me.rerere.rikkahub.utils.plus
+import me.rerere.rikkahub.utils.requestFreshGpsLocation
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
 
 @Composable
 fun SettingPage(vm: SettingVM = koinViewModel()) {
+    val context = LocalContext.current
     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
     val navController = LocalNavController.current
     val settings by vm.settings.collectAsStateWithLifecycle()
@@ -188,6 +192,33 @@ fun SettingPage(vm: SettingVM = koinViewModel()) {
                         },
                         headlineContent = { Text(stringResource(R.string.setting_page_color_mode)) },
                         supportingContent = { Text(selectedColorModeText) },
+                    )
+                    item(
+                        onClick = {
+                            val newValue = !settings.locationEnabled
+                            vm.updateSettings(settings.copy(locationEnabled = newValue))
+                            if (newValue) {
+                                me.rerere.rikkahub.utils.requestLocationPermission(context)
+                                me.rerere.rikkahub.utils.requestFreshGpsLocation(context)
+                            }
+                        },
+                        leadingContent = { Icon(HugeIcons.Pin, null) },
+                        trailingContent = {
+                            Switch(
+                                checked = settings.locationEnabled,
+                                onCheckedChange = {
+                                    vm.updateSettings(settings.copy(locationEnabled = it))
+                                    if (it) {
+                                        me.rerere.rikkahub.utils.requestLocationPermission(context)
+                                        me.rerere.rikkahub.utils.requestFreshGpsLocation(context)
+                                    }
+                                }
+                            )
+                        },
+                        headlineContent = { Text("位置信息") },
+                        supportingContent = {
+                            Text(if (settings.locationEnabled) "已开启，AI 可获取位置" else "已关闭，不获取位置")
+                        },
                     )
                     item(
                         onClick = { navController.navigate(Screen.SettingPreferences) },

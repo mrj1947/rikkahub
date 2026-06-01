@@ -476,6 +476,7 @@
   <string name="placeholder_system_version">System Version</string>
   <string name="placeholder_timezone">Timezone</string>
   <string name="placeholder_user">User</string>
+  <string name="placeholder_location">Location</string>
   <string name="prompt_page_add">Add</string>
   <string name="prompt_page_add_entry">Add Entry</string>
   <string name="prompt_page_add_lorebook">Add Lorebook</string>
