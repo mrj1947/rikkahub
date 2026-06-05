@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.PackageManager
+import android.location.Geocoder
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
@@ -13,39 +14,63 @@ import android.os.Looper
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
+import com.baidu.location.BDAbstractLocationListener
+import com.baidu.location.BDLocation
+import com.baidu.location.LocationClient
+import com.baidu.location.LocationClientOption
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.resume
+import java.util.concurrent.atomic.AtomicReference
 
 private const val TAG = "LocationUtils"
 private const val REQUEST_LOCATION_PERMISSION_CODE = 1001
-private const val GPS_TIMEOUT_MS = 10000L
-private const val GPS_CACHE_FRESH_MS = 120_000L // 2分钟内的GPS缓存有效
+private const val GPS_TIMEOUT_MS = 10_000L
+private const val GPS_CACHE_FRESH_MS = 120_000L
 
-/**
- * 最近一次获取到的 GPS 位置缓存
- * 由持续监听器更新，供同步读取
- */
+// ─── 坐标系类型 ──────────────────────────────────────────────
+
+enum class CoordType {
+    WGS84,  // 原生GPS芯片坐标
+    GCJ02,  // 国测局坐标（高德/腾讯地图用）
+    BD09,   // 百度加密坐标
+    UNKNOWN
+}
+
+// ─── 位置缓存 ──────────────────────────────────────────────
+
 object LocationCache {
     var lastLocation: Location? = null
+    var lastBdLocation: BDLocation? = null
+    var lastAddress: String? = null
     var lastRefreshTime: Long = 0L
     var isListening: Boolean = false
+    var baiduSdkActive: Boolean = false
+    var baiduLastErrorCode: Int? = null
+    var lastCoordType: CoordType = CoordType.UNKNOWN
 
-    /** 获取位置的提供者描述 */
     val providerDescription: String
         get() {
             val loc = lastLocation ?: return "无"
+            val bd = lastBdLocation
+            if (bd != null && baiduSdkActive) {
+                val t = bd.locType
+                return when (t) {
+                    BDLocation.TypeGpsLocation -> "GPS卫星(百度融合)"
+                    BDLocation.TypeNetWorkLocation -> "百度网络定位(WiFi+基站)"
+                    BDLocation.TypeOffLineLocation -> "离线定位"
+                    BDLocation.TypeNone -> "未知"
+                    else -> "百度(${locTypeDescription(t)})"
+                }
+            }
             return when (loc.provider) {
-                LocationManager.GPS_PROVIDER -> "GPS"
-                LocationManager.NETWORK_PROVIDER -> "基站/WiFi"
-                LocationManager.PASSIVE_PROVIDER -> "被动定位"
+                LocationManager.GPS_PROVIDER -> "GPS(原生)"
+                LocationManager.NETWORK_PROVIDER -> "基站/WiFi(原生)"
+                LocationManager.PASSIVE_PROVIDER -> "被动定位(原生)"
                 else -> loc.provider ?: "未知"
             }
         }
 
-    /** 获取位置精度描述 */
     val accuracyDescription: String
         get() {
             val loc = lastLocation ?: return ""
@@ -53,72 +78,201 @@ object LocationCache {
         }
 }
 
-// ─── 持续 GPS 监听 ─────────────────────────────────
+private fun locTypeDescription(type: Int): String = when (type) {
+    61 -> "GPS定位成功"
+    161 -> "网络定位成功"
+    62 -> "GPS定位失败"
+    167 -> "网络定位失败(WiFi/基站不可用)"
+    505 -> "KEY验证失败(AK错误)"
+    162 -> "隐私协议未同意"
+    else -> "未知($type)"
+}
 
-/**
- * 全局唯一的持续 GPS 监听器
- * 只要位置开关开着就保持监听，一旦有新的 GPS 信号就更新缓存
- */
+// ─── 百度SDK融合定位 ────────────────────────────────────────
+
+private var baiduClient: LocationClient? = null
 private var continuousListener: LocationListener? = null
 
-/**
- * 启动持续 GPS 监听
- * 当用户开启位置开关时调用
- * - 如果权限不足，什么都不做
- * - 已经在监听，先停止再重启
- */
+private fun createBaiduClient(context: Context): LocationClient? {
+    return try {
+        // ═══ 关键修复：百度SDK 9.x 必须先同意隐私协议，否则静默失败返回162 ═══
+        LocationClient.setAgreePrivacy(true)
+        Log.i(TAG, "Baidu SDK: privacy agreement set (setAgreePrivacy=true)")
+
+        val client = LocationClient(context.applicationContext)
+        val option = LocationClientOption().apply {
+            locationMode = LocationClientOption.LocationMode.Hight_Accuracy
+            coorType = "gcj02"
+            scanSpan = 3000
+            setIsNeedAddress(true)
+            setIsNeedLocationDescribe(true)
+            isOpenGps = true
+        }
+        client.locOption = option
+        Log.i(TAG, "Baidu SDK: LocationClient created (GCJ02 + Hight_Accuracy + WiFi scan)")
+        client
+    } catch (e: Exception) {
+        Log.e(TAG, "Failed to create Baidu LocationClient", e)
+        LocationCache.baiduSdkActive = false
+        null
+    }
+}
+
+private fun bdLocationToAndroidLocation(bd: BDLocation): Location? {
+    if (bd.latitude == 0.0 && bd.longitude == 0.0) return null
+    return Location("baidu").apply {
+        latitude = bd.latitude
+        longitude = bd.longitude
+        accuracy = bd.radius
+        time = bd.time?.let {
+            try { java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).parse(it)?.time }
+            catch (_: Exception) { null }
+        } ?: System.currentTimeMillis()
+        if (bd.hasAltitude()) altitude = bd.altitude
+        if (bd.speed > 0) speed = bd.speed
+        if (bd.direction > 0) bearing = bd.direction
+    }
+}
+
+// ─── 启动融合定位 ─────────────────────────────────────────────
+
 fun startContinuousLocationListening(context: Context) {
     if (!hasLocationPermission(context)) {
         Log.w(TAG, "startContinuousLocationListening: no permission")
         return
     }
 
-    // 如果已经在监听，先停掉
     if (LocationCache.isListening) {
         stopContinuousLocationListening(context)
     }
 
+    // === 优先启动百度SDK ===
+    val client = createBaiduClient(context)
+    if (client != null) {
+        val listener = object : BDAbstractLocationListener() {
+            override fun onReceiveLocation(bd: BDLocation?) {
+                if (bd == null) {
+                    Log.w(TAG, "Baidu SDK: onReceiveLocation returned null")
+                    return
+                }
+
+                val locType = bd.locType
+                when (locType) {
+                    61, 161 -> {
+                        LocationCache.baiduSdkActive = true
+                        LocationCache.baiduLastErrorCode = null
+                        LocationCache.lastCoordType = CoordType.GCJ02
+                        Log.i(TAG, "Baidu fix SUCCESS: type=${locTypeDescription(locType)} " +
+                                "lat=${bd.latitude},lng=${bd.longitude} " +
+                                "acc=${bd.radius}m addr=${bd.addrStr ?: "null"}")
+                    }
+                    505 -> {
+                        LocationCache.baiduLastErrorCode = 505
+                        LocationCache.baiduSdkActive = false
+                        Log.e(TAG, "Baidu SDK ERROR 505: KEY验证失败！请检查AndroidManifest中的com.baidu.lbsapi.API_KEY")
+                        return
+                    }
+                    162 -> {
+                        LocationCache.baiduLastErrorCode = 162
+                        LocationCache.baiduSdkActive = false
+                        Log.e(TAG, "Baidu SDK ERROR 162: 隐私协议未同意！必须先调LocationClient.setAgreePrivacy(true)")
+                        return
+                    }
+                    62 -> {
+                        LocationCache.baiduLastErrorCode = 62
+                        Log.w(TAG, "Baidu SDK: GPS定位失败(62), 可能在室内，等待网络定位...")
+                    }
+                    167 -> {
+                        LocationCache.baiduLastErrorCode = 167
+                        Log.w(TAG, "Baidu SDK: 网络定位失败(167), WiFi/基站不可用")
+                        return
+                    }
+                    else -> {
+                        LocationCache.baiduLastErrorCode = locType
+                        Log.w(TAG, "Baidu SDK: locType=$locType (${locTypeDescription(locType)})")
+                        if (bd.latitude == 0.0 && bd.longitude == 0.0) return
+                    }
+                }
+
+                LocationCache.lastBdLocation = bd
+
+                val addr = buildString {
+                    bd.addrStr?.let { append(it) }
+                    if (isBlank()) bd.locationDescribe?.let { append(it) }
+                }.takeIf { it.isNotBlank() }
+                LocationCache.lastAddress = addr
+
+                val androidLoc = bdLocationToAndroidLocation(bd)
+                if (androidLoc != null) {
+                    LocationCache.lastLocation = androidLoc
+                    LocationCache.lastRefreshTime = System.currentTimeMillis()
+                }
+            }
+        }
+
+        try {
+            client.registerLocationListener(listener)
+            client.start()
+            baiduClient = client
+            LocationCache.isListening = true
+            Log.i(TAG, "Baidu fusion location STARTED (client.start() called)")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start Baidu location", e)
+            LocationCache.baiduSdkActive = false
+            baiduClient = null
+        }
+    }
+
+    // === 同时启动原生GPS监听作为兜底 ===
     try {
         val locationManager =
             context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
 
-        val listener = object : LocationListener {
+        val nativeListener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                Log.d(TAG, "Continuous GPS fix: ${location.latitude},${location.longitude} acc=${location.accuracy} provider=${location.provider}")
-                LocationCache.lastLocation = location
-                LocationCache.lastRefreshTime = System.currentTimeMillis()
+                Log.d(TAG, "Native GPS fix: ${location.latitude},${location.longitude} " +
+                        "acc=${location.accuracy} provider=${location.provider}")
+
+                // 只有百度SDK未激活时，原生GPS才写入缓存
+                if (!LocationCache.baiduSdkActive) {
+                    val current = LocationCache.lastLocation
+                    if (current == null || (location.hasAccuracy() && location.accuracy < (current.accuracy.takeIf { current.hasAccuracy() } ?: 999f))) {
+                        LocationCache.lastLocation = location
+                        LocationCache.lastRefreshTime = System.currentTimeMillis()
+                        LocationCache.lastCoordType = CoordType.WGS84
+
+                        if (LocationCache.lastAddress == null) {
+                            reverseGeocodeAsync(context, location)
+                        }
+                    }
+                } else {
+                    Log.d(TAG, "Native GPS ignored: Baidu SDK active, using fused location instead")
+                }
             }
 
             override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
             override fun onProviderEnabled(provider: String) {
                 Log.d(TAG, "Provider enabled: $provider")
             }
-
             override fun onProviderDisabled(provider: String) {
                 Log.d(TAG, "Provider disabled: $provider")
             }
         }
 
-        // 请求持续位置更新（1秒最小间隔，5米最小距离）
-        // 优先用 GPS_PROVIDER，如果 GPS 没开则用 NETWORK_PROVIDER
         val providers = listOf(
             LocationManager.GPS_PROVIDER,
             LocationManager.NETWORK_PROVIDER
         )
 
-        var anyProviderStarted = false
+        var anyNativeStarted = false
         for (provider in providers) {
             if (locationManager.isProviderEnabled(provider)) {
                 try {
                     locationManager.requestLocationUpdates(
-                        provider,
-                        1000L,           // 最小时间间隔：1秒
-                        5f,              // 最小距离变化：5米
-                        listener,
-                        Looper.getMainLooper()
+                        provider, 1000L, 5f, nativeListener, Looper.getMainLooper()
                     )
-                    Log.d(TAG, "Started continuous listening on $provider")
-                    anyProviderStarted = true
+                    Log.d(TAG, "Started native listening on $provider")
+                    anyNativeStarted = true
                 } catch (e: SecurityException) {
                     Log.w(TAG, "Security exception starting $provider", e)
                 } catch (e: Exception) {
@@ -127,21 +281,21 @@ fun startContinuousLocationListening(context: Context) {
             }
         }
 
-        if (anyProviderStarted) {
-            continuousListener = listener
-            LocationCache.isListening = true
-            Log.i(TAG, "Continuous location listening started")
-        } else {
-            Log.w(TAG, "No location provider available")
+        if (anyNativeStarted) {
+            continuousListener = nativeListener
+            if (baiduClient == null) {
+                LocationCache.isListening = true
+            }
+            Log.i(TAG, "Native location listening started (fallback)")
         }
 
-        // 同时也尝试获取一次上次的已知位置作为初始缓存
         try {
             val lastKnown = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
                 ?: locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-            if (lastKnown != null) {
+            if (lastKnown != null && LocationCache.lastLocation == null) {
                 LocationCache.lastLocation = lastKnown
                 LocationCache.lastRefreshTime = System.currentTimeMillis()
+                LocationCache.lastCoordType = CoordType.WGS84
                 Log.d(TAG, "Initial cache from lastKnown: ${lastKnown.provider}")
             }
         } catch (_: SecurityException) {}
@@ -153,44 +307,71 @@ fun startContinuousLocationListening(context: Context) {
     }
 }
 
-/**
- * 停止持续 GPS 监听
- * 当用户关闭位置开关时调用
- */
 fun stopContinuousLocationListening(context: Context) {
-    val listener = continuousListener ?: return
     try {
-        val locationManager =
-            context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
-        locationManager.removeUpdates(listener)
+        baiduClient?.stop()
     } catch (e: Exception) {
-        Log.w(TAG, "Error stopping location listening", e)
+        Log.w(TAG, "Error stopping Baidu client", e)
+    }
+    baiduClient = null
+    LocationCache.baiduSdkActive = false
+
+    val listener = continuousListener
+    if (listener != null) {
+        try {
+            val locationManager =
+                context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return
+            locationManager.removeUpdates(listener)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping native location listening", e)
+        }
     }
     continuousListener = null
     LocationCache.isListening = false
-    Log.i(TAG, "Continuous location listening stopped")
+    LocationCache.lastCoordType = CoordType.UNKNOWN
+    Log.i(TAG, "All location listening stopped")
 }
 
-// ─── 权限相关 ─────────────────────────────────────
+// ─── 逆地理编码（原生兜底用） ────────────────────────────────
 
-/**
- * 检查位置权限是否已授予
- */
+private fun reverseGeocodeAsync(context: Context, location: Location) {
+    Thread {
+        try {
+            if (!Geocoder.isPresent()) return@Thread
+            val geocoder = Geocoder(context, Locale.getDefault())
+            @Suppress("DEPRECATION")
+            val addresses = geocoder.getFromLocation(location.latitude, location.longitude, 1)
+            if (!addresses.isNullOrEmpty()) {
+                val addr = addresses[0]
+                val desc = buildString {
+                    addr.countryName?.let { append(it) }
+                    addr.adminArea?.let { append(" ").append(it) }
+                    addr.locality?.let { append(" ").append(it) }
+                    addr.subLocality?.let { append(" ").append(it) }
+                    addr.thoroughfare?.let { append(" ").append(it) }
+                }.trim()
+                if (desc.isNotBlank()) {
+                    LocationCache.lastAddress = desc
+                    Log.d(TAG, "Reverse geocode: $desc")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Reverse geocode failed", e)
+        }
+    }.start()
+}
+
+// ─── 权限相关 ──────────────────────────────────────────────
+
 fun hasLocationPermission(context: Context): Boolean {
     return ContextCompat.checkSelfPermission(
-        context,
-        Manifest.permission.ACCESS_FINE_LOCATION
+        context, Manifest.permission.ACCESS_FINE_LOCATION
     ) == PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.ACCESS_COARSE_LOCATION
+                context, Manifest.permission.ACCESS_COARSE_LOCATION
             ) == PackageManager.PERMISSION_GRANTED
 }
 
-/**
- * 请求位置权限
- * 授权后自动启动持续定位
- */
 fun requestLocationPermission(context: Context) {
     if (!hasLocationPermission(context)) {
         Log.d(TAG, "Requesting location permission")
@@ -203,27 +384,24 @@ fun requestLocationPermission(context: Context) {
             REQUEST_LOCATION_PERMISSION_CODE
         )
     } else {
-        // 权限已有，启动持续监听
         startContinuousLocationListening(context)
     }
 }
 
-// ─── 获取位置（同步读取）────────────────────────────
+// ─── 获取位置（同步读取） ──────────────────────────────────
 
-/**
- * 获取当前位置（同步方法）
- *
- * 优先返回持续监听器缓存的新鲜 GPS 数据
- * 如果缓存过期或不存在，尝试获取一次新鲜的 GPS 定位（最多等 10 秒）
- * 超时后拿 NETWORK 位置兜底
- */
 fun getCurrentLocation(context: Context): Location? {
-    // 1. 检查缓存是否有新鲜 GPS 数据（2分钟内）
     val cache = LocationCache.lastLocation
     val cacheAge = System.currentTimeMillis() - LocationCache.lastRefreshTime
     if (cache != null && cacheAge < GPS_CACHE_FRESH_MS) {
-        Log.d(TAG, "Using cache: ${cache.provider}, age=${cacheAge}ms, acc=${if (cache.hasAccuracy()) cache.accuracy else "N/A"}")
+        Log.d(TAG, "Using cache: source=${LocationCache.providerDescription}, " +
+                "coord=${LocationCache.lastCoordType}, age=${cacheAge}ms, " +
+                "acc=${if (cache.hasAccuracy()) cache.accuracy else "N/A"}")
         return cache
+    }
+
+    if (LocationCache.baiduSdkActive && LocationCache.lastBdLocation == null) {
+        Log.d(TAG, "Baidu SDK active but no fix yet, cache is stale or empty")
     }
 
     if (!hasLocationPermission(context)) return null
@@ -231,66 +409,54 @@ fun getCurrentLocation(context: Context): Location? {
     val locationManager =
         context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
 
-    // 2. 尝试获取最新已知位置（缓存已过期但 lastKnown 是新数据）
-    try {
-        val gpsLast = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-        if (gpsLast != null && System.currentTimeMillis() - gpsLast.time < GPS_CACHE_FRESH_MS) {
-            Log.d(TAG, "getCurrentLocation: lastKnown GPS, acc=${gpsLast.accuracy}")
-            LocationCache.lastLocation = gpsLast
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return gpsLast
-        }
-    } catch (_: SecurityException) {}
+    if (!LocationCache.baiduSdkActive) {
+        try {
+            val gpsLast = locationManager.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+            if (gpsLast != null && System.currentTimeMillis() - gpsLast.time < GPS_CACHE_FRESH_MS) {
+                Log.d(TAG, "getCurrentLocation: lastKnown GPS (WGS84), acc=${gpsLast.accuracy}")
+                LocationCache.lastLocation = gpsLast
+                LocationCache.lastRefreshTime = System.currentTimeMillis()
+                LocationCache.lastCoordType = CoordType.WGS84
+                return gpsLast
+            }
+        } catch (_: SecurityException) {}
 
-    // 3. 如果 GPS 没在持续监听，尝试同步获取一次新鲜定位
-    if (!LocationCache.isListening && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-        Log.d(TAG, "No continuous listener, trying one-shot GPS...")
-        val syncLocation = tryGetGpsSync(locationManager)
-        if (syncLocation != null) {
-            LocationCache.lastLocation = syncLocation
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return syncLocation
+        if (!LocationCache.isListening && locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            Log.d(TAG, "No continuous listener, trying one-shot GPS...")
+            val syncLocation = tryGetGpsSync(locationManager)
+            if (syncLocation != null) {
+                LocationCache.lastLocation = syncLocation
+                LocationCache.lastRefreshTime = System.currentTimeMillis()
+                LocationCache.lastCoordType = CoordType.WGS84
+                return syncLocation
+            }
         }
+
+        try {
+            val network = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+            if (network != null) {
+                Log.d(TAG, "getCurrentLocation: fallback to NETWORK (WGS84)")
+                LocationCache.lastLocation = network
+                LocationCache.lastRefreshTime = System.currentTimeMillis()
+                LocationCache.lastCoordType = CoordType.WGS84
+                return network
+            }
+        } catch (_: SecurityException) {}
     }
-
-    // 4. 兜底：获取网络位置
-    try {
-        val network = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-        if (network != null) {
-            Log.d(TAG, "getCurrentLocation: fallback to NETWORK, acc=${if (network.hasAccuracy()) network.accuracy else "N/A"}")
-            LocationCache.lastLocation = network
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return network
-        }
-    } catch (_: SecurityException) {}
-
-    // 5. 最后的兜底：被动位置
-    try {
-        val passive = locationManager.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER)
-        if (passive != null) {
-            LocationCache.lastLocation = passive
-            LocationCache.lastRefreshTime = System.currentTimeMillis()
-            return passive
-        }
-    } catch (_: SecurityException) {}
 
     return null
 }
 
-/**
- * 同步等待一次 GPS 定位（使用 suspendCancellableCoroutine 优雅等待）
- * 最多等 GPS_TIMEOUT_MS 毫秒
- */
 private fun tryGetGpsSync(locationManager: LocationManager): Location? {
-    // 使用 CountDownLatch 在主线程回调上同步等待
-    val latch = java.util.concurrent.CountDownLatch(1)
-    var result: Location? = null
+    val latch = CountDownLatch(1)
+    val resultRef = AtomicReference<Location?>(null)
 
     val listener = object : LocationListener {
         override fun onLocationChanged(location: Location) {
-            result = location
+            resultRef.set(location)
             LocationCache.lastLocation = location
             LocationCache.lastRefreshTime = System.currentTimeMillis()
+            LocationCache.lastCoordType = CoordType.WGS84
             latch.countDown()
             locationManager.removeUpdates(this)
         }
@@ -302,16 +468,13 @@ private fun tryGetGpsSync(locationManager: LocationManager): Location? {
 
     try {
         locationManager.requestSingleUpdate(
-            LocationManager.GPS_PROVIDER,
-            listener,
-            Looper.getMainLooper()
+            LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper()
         )
         val acquired = latch.await(GPS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-        if (acquired && result != null) {
-            Log.d(TAG, "tryGetGpsSync: got fix, acc=${result!!.accuracy}")
-            return result
+        if (acquired && resultRef.get() != null) {
+            Log.d(TAG, "tryGetGpsSync: got fix, acc=${resultRef.get()!!.accuracy}")
+            return resultRef.get()
         }
-        // 超时，移除监听
         locationManager.removeUpdates(listener)
         Log.w(TAG, "tryGetGpsSync: timeout after ${GPS_TIMEOUT_MS}ms")
     } catch (e: SecurityException) {
@@ -321,45 +484,57 @@ private fun tryGetGpsSync(locationManager: LocationManager): Location? {
     return null
 }
 
-// ─── 格式化输出 ──────────────────────────────────
+// ─── 格式化输出 ─────────────────────────────────────────────
 
-/**
- * 格式化位置信息为文本
- */
 fun formatLocation(location: Location): String {
     return "%.6f,%.6f".format(location.latitude, location.longitude)
 }
 
-/**
- * 获取格式化的完整位置信息
- */
 fun getFormattedLocation(context: Context): String? {
-    return getCurrentLocation(context)?.let { location ->
-        val provider = when {
-            location.provider == LocationManager.GPS_PROVIDER -> "GPS"
-            location.provider == LocationManager.NETWORK_PROVIDER -> "基站/WiFi"
-            location.provider == LocationManager.PASSIVE_PROVIDER -> "被动"
-            else -> location.provider
-        }
-        val accuracyNote = if (location.hasAccuracy() && location.accuracy < 100f) {
-            "（GPS 精确定位，精度约${location.accuracy.toInt()}米）"
-        } else if (location.hasAccuracy()) {
-            "（精度约${location.accuracy.toInt()}米）"
-        } else {
-            ""
-        }
-        "Latitude: %.6f, Longitude: %.6f $provider$accuracyNote".format(
-            location.latitude,
-            location.longitude
-        )
+    val location = getCurrentLocation(context) ?: return null
+
+    val coordTypeName = when (LocationCache.lastCoordType) {
+        CoordType.GCJ02 -> "GCJ02(国测局坐标)"
+        CoordType.WGS84 -> "WGS84(GPS原生坐标)"
+        CoordType.BD09 -> "BD09(百度加密坐标)"
+        CoordType.UNKNOWN -> "未知坐标系"
     }
+
+    val provider = LocationCache.providerDescription
+    val accuracyNote = if (location.hasAccuracy() && location.accuracy < 100f) {
+        "（GPS精确定位，精度约${location.accuracy.toInt()}米）"
+    } else if (location.hasAccuracy()) {
+        "（精度约${location.accuracy.toInt()}米）"
+    } else {
+        ""
+    }
+
+    val coords = "Latitude: %.6f, Longitude: %.6f".format(
+        location.latitude, location.longitude
+    )
+
+    val coordNote = " [坐标系: $coordTypeName]"
+
+    val baiduWarning = when (LocationCache.baiduLastErrorCode) {
+        505 -> " [百度SDK错误: Key验证失败(505)，请检查API_KEY]"
+        162 -> " [百度SDK错误: 隐私协议未同意(162)]"
+        62 -> " [百度SDK: GPS定位失败(62)，已回退到网络/原生定位]"
+        167 -> " [百度SDK: 网络定位失败(167)，WiFi/基站不可用]"
+        else -> ""
+    }
+
+    val addressText = LocationCache.lastAddress
+    val addrPart = if (!addressText.isNullOrBlank()) {
+        "\n地址: $addressText"
+    } else {
+        ""
+    }
+
+    return "$coords $provider$coordNote$accuracyNote$addrPart$baiduWarning"
 }
 
-// ─── Context 工具 ────────────────────────────────
+// ─── Context 工具 ──────────────────────────────────────────
 
-/**
- * 从 Context 递归查找 Activity
- */
 fun Context.findActivity(): Activity {
     var context = this
     while (context is ContextWrapper) {

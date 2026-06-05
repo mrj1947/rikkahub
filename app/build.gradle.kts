@@ -81,7 +81,7 @@ android {
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }
         debug {
-            applicationIdSuffix = ".debug"
+            // applicationIdSuffix = ".debug"  // 注释掉：百度AK鉴权需要包名与控制台一致(me.rerere.rikkahub)
             buildConfigField("String", "VERSION_NAME", "\"${android.defaultConfig.versionName}\"")
             buildConfigField("String", "VERSION_CODE", "\"${android.defaultConfig.versionCode}\"")
         }
@@ -89,7 +89,7 @@ android {
             initWith(getByName("release"))
             matchingFallbacks.add("release")
             signingConfig = signingConfigs.getByName("debug")
-            applicationIdSuffix = ".debug"
+            // applicationIdSuffix = ".debug"  // 注释掉：百度AK鉴权
             isDebuggable = false
             isMinifyEnabled = false
             isShrinkResources = false
@@ -282,6 +282,11 @@ dependencies {
 
     // sqlite-android (requery SQLite for Android)
     implementation(libs.sqlite.android)
+
+
+    // 百度定位SDK (融合定位: GPS+WiFi+基站)
+    implementation("com.baidu.lbsyun:BaiduMapSDK_Location_All:9.6.8")
+    implementation("com.baidu.lbsyun:base:8.1.0")
 
     // modules
     implementation(project(":ai"))

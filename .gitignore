@@ -11,3 +11,31 @@ local.properties
 .cursor
 .history
 .kotlin
+# === 个人构建产物 & 本地配置 ===
+*.apk
+app/google-services.json
+node_modules/
+pnpm-lock.yaml
+bun.lock
+package.json
+.agents/
+.claude/
+.cursor/
+.history/
+skills-lock.json
+# 构建输出
+app/build/
+web/build/
+common/build/
+ai/build/
+highlight/build/
+search/build/
+speech/build/
+material3/build/
+locale-tui/build/
+# Kotlin
+*.hprof
+# Android
+captures/
+.externalNativeBuild/
+.cxx/

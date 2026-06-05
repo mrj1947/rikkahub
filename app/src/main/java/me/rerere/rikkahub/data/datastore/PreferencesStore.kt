@@ -29,6 +29,7 @@ import me.rerere.rikkahub.data.ai.prompts.DEFAULT_SUGGESTION_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TITLE_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.DEFAULT_TRANSLATION_PROMPT
 import me.rerere.rikkahub.data.ai.prompts.LEARNING_MODE_PROMPT
+import me.rerere.rikkahub.data.ai.prompts.LOCATION_AWARENESS_PROMPT
 import me.rerere.asr.ASRProviderSetting
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV1Migration
 import me.rerere.rikkahub.data.datastore.migration.PreferenceStoreV2Migration
@@ -705,6 +706,7 @@ internal val DEFAULT_ASSISTANTS = listOf(
     Assistant(
         id = Uuid.parse("3d47790c-c415-4b90-9388-751128adb0a0"),
         name = "",
+        modeInjectionIds = setOf(Uuid.parse("a1b2c3d4-e5f6-7890-abcd-ef1234567890")),
         systemPrompt = """
             You are a helpful assistant, called {{char}}, based on model {{model_name}}.
 
@@ -715,6 +717,7 @@ internal val DEFAULT_ASSISTANTS = listOf(
             - Device Info: {{device_info}}
             - System Version: {{system_version}}
             - User Nickname: {{user}}
+            - Location: {{location}}
 
             ## Hint
             - If the user does not specify a language, reply in the user's primary language.
@@ -746,5 +749,12 @@ val DEFAULT_MODE_INJECTIONS = listOf(
         content = LEARNING_MODE_PROMPT,
         position = InjectionPosition.AFTER_SYSTEM_PROMPT,
         name = "Learning Mode"
+    ),
+    PromptInjection.ModeInjection(
+        id = Uuid.parse("a1b2c3d4-e5f6-7890-abcd-ef1234567890"),
+        content = LOCATION_AWARENESS_PROMPT,
+        position = InjectionPosition.AFTER_SYSTEM_PROMPT,
+        name = "Location Awareness",
+        priority = 100
     )
 )

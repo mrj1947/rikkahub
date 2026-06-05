@@ -85,6 +85,7 @@ import me.rerere.rikkahub.utils.startContinuousLocationListening
 import kotlinx.coroutines.delay
 import me.rerere.rikkahub.utils.getCurrentLocation
 import me.rerere.rikkahub.utils.hasLocationPermission
+import me.rerere.rikkahub.utils.CoordType
 import me.rerere.rikkahub.utils.stopContinuousLocationListening
 import org.koin.androidx.compose.koinViewModel
 import org.koin.compose.koinInject
@@ -99,14 +100,30 @@ private fun rememberLocationDisplay(enabled: Boolean): String {
                 val loc = getCurrentLocation(context)
                 value = if (loc != null) {
                     val provider = when {
-                        loc.provider == android.location.LocationManager.GPS_PROVIDER -> "GPS"
-                        loc.provider == android.location.LocationManager.NETWORK_PROVIDER -> "基站/WiFi"
+                        LocationCache.baiduSdkActive && LocationCache.lastCoordType == CoordType.GCJ02 -> "百度融合定位"
+                        loc.provider == android.location.LocationManager.GPS_PROVIDER -> "GPS(原生)"
+                        loc.provider == android.location.LocationManager.NETWORK_PROVIDER -> "基站/WiFi(原生)"
                         loc.provider == android.location.LocationManager.PASSIVE_PROVIDER -> "被动定位"
+                        loc.provider == "baidu" -> "百度融合定位"
                         else -> loc.provider
                     }
-                    val listening = if (LocationCache.isListening) "实时监" else "单次"
+                    val coordType = when (LocationCache.lastCoordType) {
+                        CoordType.GCJ02 -> "GCJ02"
+                        CoordType.WGS84 -> "WGS84"
+                        CoordType.BD09 -> "BD09"
+                        CoordType.UNKNOWN -> ""
+                    }
+                    val coordNote = if (coordType.isNotEmpty()) " [$coordType]" else ""
+                    val listening = if (LocationCache.isListening) "实时" else "单次"
                     val acc = if (loc.hasAccuracy()) " ±${loc.accuracy.toInt()}m" else ""
-                    "已开启 · $provider · ${formatLocation(loc)}$acc"
+                    val baiduErr = when (LocationCache.baiduLastErrorCode) {
+                        505 -> " ⚠Key错误"
+                        162 -> " ⚠隐私协议"
+                        62 -> " ⚠GPS失败"
+                        167 -> " ⚠网络失败"
+                        else -> ""
+                    }
+                    "已开启 · $provider$coordNote · ${formatLocation(loc)}$acc$baiduErr"
                 } else {
                     "已开启，等待定位..."
                 }
